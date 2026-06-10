@@ -1,0 +1,18 @@
+{
+  "cliente": "ISA",
+  "nombre_completo": "ISA S.A. E.S.P.",
+  "ejecutor": "DISPOWER S.A.S E.S.P.",
+  "nit_ejecutor": "901.580.467-1",
+  "contrato": "Por definir",
+  "interventor": "Por definir",
+  "capitulos": [
+    {"id": 1, "num": "1", "titulo": "Información básica", "parent": null},
+    {"id": 2, "num": "2", "titulo": "Descripción del proyecto", "parent": null},
+    {"id": 3, "num": "3", "titulo": "Características generales del contrato", "parent": null},
+    {"id": 8, "num": "4", "titulo": "Gestión de operaciones", "parent": null},
+    {"id": 10, "num": "5", "titulo": "Gestión comercial", "parent": null},
+    {"id": 17, "num": "6", "titulo": "Gestión financiera", "parent": null},
+    {"id": 25, "num": "7", "titulo": "Estado jurídico del contrato", "parent": null}
+  ],
+  "db_schemas": {}
+}
