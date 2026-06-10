@@ -197,14 +197,29 @@ class WordGenerator:
     # ------------------------------------------------------------------ #
     # Generador principal
     # ------------------------------------------------------------------ #
+    def _limpiar_body(self):
+        """
+        Elimina todos los párrafos y tablas del body del documento,
+        preservando headers, footers y estilos de la plantilla.
+        """
+        from docx.oxml.ns import qn
+        body = self.doc.element.body
+        # Recoger todos los elementos hijo excepto sectPr (configuración de sección/página)
+        to_remove = []
+        for child in body:
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag != 'sectPr':
+                to_remove.append(child)
+        for el in to_remove:
+            body.remove(el)
+
     def generar(self, output_path: str):
         """Genera el documento Word completo."""
+        # 1. Actualizar mes/año en la plantilla (portada, encabezados)
         self._replace_in_template()
 
-        # Limpiar contenido existente del body (excepto header/footer)
-        # y agregar las secciones seleccionadas
-        # Estrategia: agregar al final del documento existente
-        self.doc.add_page_break()
+        # 2. Limpiar body y reescribir SOLO los capítulos seleccionados
+        self._limpiar_body()
 
         all_caps = self.config.get("capitulos", [])
         selected = self._get_selected_with_parents(all_caps)
@@ -212,7 +227,7 @@ class WordGenerator:
         for cap in all_caps:
             if cap["id"] not in selected:
                 continue
-            num = cap["num"]
+            num   = cap["num"]
             titulo = cap["titulo"].upper()
             level_depth = len(num.split("."))
 
@@ -223,7 +238,6 @@ class WordGenerator:
             else:
                 self._add_heading(f"{num}. {titulo}", level=3)
 
-            # Dispatcher: genera contenido por capítulo
             self._render_capitulo(cap["id"], cap["num"])
 
         output_path_obj = Path(output_path)
@@ -480,49 +494,104 @@ class WordGenerator:
             self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
 
     def _cap_gestion_sac(self):
-        sac = self.metricas.get("sac", {})
-        total = sac.get("total", 0)
+        sac      = self.metricas.get("sac", {})
+        total    = sac.get("total", 0)
         abiertos = sac.get("abiertos", 0)
         cerrados = sac.get("cerrados", 0)
-        hurtos = sac.get("hurtos", 0)
+        hurtos   = sac.get("hurtos", 0)
+        bloqueos = sac.get("bloqueos_facturacion", 0)
+        criticos = sac.get("criticos_vencidos", 0)
+        dias_prom = sac.get("dias_prom_cierre", 0)
 
         self._add_paragraph(
             f"Durante el mes de {self.mes_nombre} de {self.ano}, se registraron {fmt_num(total)} "
             f"casos en el sistema de PQR. De estos, {fmt_num(cerrados)} fueron cerrados y "
-            f"{fmt_num(abiertos)} permanecen abiertos. Se registraron además {fmt_num(hurtos)} "
-            "casos relacionados con hurto de componentes."
+            f"{fmt_num(abiertos)} permanecen abiertos (Crítico / Moderado / Leve). "
+            f"Se registraron {fmt_num(hurtos)} casos relacionados con hurto de componentes y "
+            f"{fmt_num(bloqueos)} PQRs con bloqueo de facturación activo. "
+            f"El tiempo promedio de cierre para los casos resueltos fue de {dias_prom} días hábiles."
         )
 
-        if total > 0:
-            headers = ["Estado", "Cantidad", "Porcentaje"]
+        if criticos > 0:
+            self._add_paragraph(
+                f"⚠ Atención: {fmt_num(criticos)} PQRs superan los 30 días sin atención, ",
+                bold=True
+            )
+
+        # Tabla 1 — Semáforo de estado
+        por_semaforo = sac.get("por_semaforo", {})
+        if por_semaforo:
             pct = lambda n: f"{n/total*100:.1f}%" if total > 0 else "0%"
-            rows = [
-                ["Cerrados", fmt_num(cerrados), pct(cerrados)],
-                ["Abiertos", fmt_num(abiertos), pct(abiertos)],
-                ["Hurtos", fmt_num(hurtos), pct(hurtos)],
-                ["TOTAL", fmt_num(total), "100%"]
-            ]
-            self._add_paragraph(f"Tabla. Resumen PQR {self.mes_nombre} {self.ano}", bold=True)
-            self._build_table(headers, rows)
+            headers = ["Estado (Semáforo)", "Cantidad", "Porcentaje"]
+            rows = [[k, fmt_num(v), pct(v)] for k, v in por_semaforo.items()]
+            rows.append(["TOTAL", fmt_num(total), "100%"])
+            self._add_paragraph(f"Tabla. Resumen PQR por semáforo {self.mes_nombre} {self.ano}", bold=True)
+            self._build_table(headers, rows, [4000, 2500, 2500])
             self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
 
+        # Tabla 2 — Por tipo de menú (RECLAMO / PETICION / etc.)
+        por_menu = sac.get("por_tipo_menu", {})
+        if por_menu:
+            headers2 = ["Tipo de PQR", "Cantidad"]
+            rows2 = [[k, fmt_num(v)] for k, v in list(por_menu.items())[:10]]
+            self._add_paragraph(f"Tabla. PQR por tipo {self.mes_nombre} {self.ano}", bold=True)
+            self._build_table(headers2, rows2, [5500, 3500])
+            self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
+
+        # Tabla 3 — Tipificación (SubMenu1)
         por_tipo = sac.get("por_tipo", {})
         if por_tipo:
-            headers2 = ["Tipificación", "Cantidad"]
-            rows2 = [[k, v] for k, v in list(por_tipo.items())[:10]]
+            headers3 = ["Tipificación", "Cantidad"]
+            rows3 = [[k, fmt_num(v)] for k, v in list(por_tipo.items())[:12]]
             self._add_paragraph(f"Tabla. PQR por tipificación {self.mes_nombre} {self.ano}", bold=True)
-            self._build_table(headers2, rows2)
+            self._build_table(headers3, rows3)
             self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
 
-        g1 = self.graficos.get("sac_estado")
+        # Tabla 4 — Por canal
+        por_canal = sac.get("por_canal", {})
+        if por_canal:
+            total_canal = sum(por_canal.values())
+            pct_c = lambda n: f"{n/total_canal*100:.1f}%" if total_canal > 0 else "0%"
+            headers4 = ["Canal de atención", "Cantidad", "Porcentaje"]
+            rows4 = [[k, fmt_num(v), pct_c(v)] for k, v in por_canal.items()]
+            rows4.append(["TOTAL", fmt_num(total_canal), "100%"])
+            self._add_paragraph(f"Tabla. PQR por canal de atención {self.mes_nombre} {self.ano}", bold=True)
+            self._build_table(headers4, rows4, [4000, 2500, 2500])
+            self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
+
+        # Tabla 5 — Por proyecto/seccional
+        por_proyecto = sac.get("por_proyecto", {})
+        if por_proyecto:
+            headers5 = ["Proyecto / Seccional", "Cantidad"]
+            rows5 = [[k, fmt_num(v)] for k, v in list(por_proyecto.items())[:15]]
+            self._add_paragraph(f"Tabla. PQR por proyecto/seccional {self.mes_nombre} {self.ano}", bold=True)
+            self._build_table(headers5, rows5)
+            self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
+
+        # Tabla 6 — Por asesor
+        por_asesor = sac.get("por_asesor", {})
+        if por_asesor:
+            headers6 = ["Asesor", "Gestiones"]
+            rows6 = [[k, fmt_num(v)] for k, v in list(por_asesor.items())[:10]]
+            self._add_paragraph(f"Tabla. Gestión PQR por asesor {self.mes_nombre} {self.ano}", bold=True)
+            self._build_table(headers6, rows6)
+            self._add_paragraph("Elaboración propia de Dispower S.A.S E.S.P.", italic=True, size=8)
+
+        # Gráficos
+        g1 = self.graficos.get("sac_semaforo")
         if g1:
-            self._add_paragraph(f"Gráfico. Estado PQR – {self.mes_nombre} {self.ano}", bold=True)
+            self._add_paragraph(f"Gráfico. Estado PQR por semáforo – {self.mes_nombre} {self.ano}", bold=True)
             self._add_image(g1, 5.0)
 
         g2 = self.graficos.get("sac_tipo")
         if g2:
             self._add_paragraph(f"Gráfico. PQR por tipificación – {self.mes_nombre} {self.ano}", bold=True)
             self._add_image(g2, 6.5)
+
+        g3 = self.graficos.get("sac_canal")
+        if g3:
+            self._add_paragraph(f"Gráfico. PQR por canal de atención – {self.mes_nombre} {self.ano}", bold=True)
+            self._add_image(g3, 5.0)
 
     def _cap_gestion_social(self):
         self._add_paragraph(
