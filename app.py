@@ -1,176 +1,264 @@
 """
-app.py - Backend Flask para generación automática de informes Word
+utils/chart_generator.py - Genera gráficos PNG para insertar en el documento Word
 """
-import os
-import json
-import uuid
-import shutil
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file, render_template
-from werkzeug.utils import secure_filename
+import io
 
-# ---- Importar utilidades propias
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-from utils.data_processor import DataProcessor, MESES
-from utils.chart_generator import generar_todos_los_graficos
-from utils.word_generator import WordGenerator
+# Paleta corporativa Dispower
+COLORS = ["#1B4F8A", "#2E86C1", "#85C1E9", "#F39C12", "#E74C3C", "#27AE60",
+          "#8E44AD", "#17A589", "#D35400", "#2C3E50"]
 
-# ── Configuración ──────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
-UPLOAD_FOLDER = BASE_DIR / "uploads"
-OUTPUT_FOLDER = BASE_DIR / "output"
-CONFIG_FOLDER = BASE_DIR / "config"
-TEMP_FOLDER   = BASE_DIR / "temp"
-
-for d in [UPLOAD_FOLDER, OUTPUT_FOLDER, CONFIG_FOLDER, TEMP_FOLDER]:
-    d.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_EXTENSIONS = {"xlsx", "docx"}
-
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.titlesize": 10,
+    "axes.titleweight": "bold",
+    "figure.dpi": 120,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
 
 
-def allowed(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+def _save_fig(fig, output_dir: str, name: str) -> str:
+    path = Path(output_dir) / f"{name}.png"
+    fig.savefig(str(path), bbox_inches="tight", dpi=120, facecolor="white")
+    plt.close(fig)
+    return str(path)
 
 
-def load_config(cliente: str) -> dict:
-    path = CONFIG_FOLDER / f"{cliente}.json"
-    if not path.exists():
-        return {}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def grafico_barras_operaciones(metricas: dict, output_dir: str) -> str:
+    """Mantenimientos preventivos vs correctivos por municipio."""
+    por_mun = metricas.get("por_municipio", {})
+    if not por_mun:
+        return ""
+
+    municipios = list(por_mun.keys())[:12]
+    func = [por_mun[m]["funcional"] for m in municipios]
+    no_func = [por_mun[m]["no_funcional"] for m in municipios]
+
+    x = np.arange(len(municipios))
+    w = 0.4
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    b1 = ax.bar(x - w/2, func, w, label="Funcional", color=COLORS[1], edgecolor="white")
+    b2 = ax.bar(x + w/2, no_func, w, label="No funcional", color=COLORS[4], edgecolor="white")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([m[:14] for m in municipios], rotation=30, ha="right", fontsize=8)
+    ax.set_title("Estado del parque por municipio")
+    ax.set_ylabel("N° de visitas")
+    ax.legend()
+    ax.bar_label(b1, padding=2, fontsize=7)
+    ax.bar_label(b2, padding=2, fontsize=7)
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "operaciones_municipio")
 
 
-def list_clients() -> list:
-    return [p.stem for p in CONFIG_FOLDER.glob("*.json")]
+def grafico_torta_funcionalidad(metricas: dict, output_dir: str) -> str:
+    func = metricas.get("funcionales", 0)
+    no_func = metricas.get("no_funcionales", 0)
+    if func + no_func == 0:
+        return ""
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    vals = [func, no_func]
+    labels = [f"Funcional\n({func})", f"No Funcional\n({no_func})"]
+    ax.pie(vals, labels=labels, colors=[COLORS[5], COLORS[4]],
+           autopct="%1.1f%%", startangle=90,
+           wedgeprops={"edgecolor": "white", "linewidth": 1.5})
+    ax.set_title("Funcionalidad de visitas")
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "operaciones_torta")
 
 
-# ── Rutas ──────────────────────────────────────────────────────────────
-@app.route("/")
-def index():
-    return render_template("index.html", clientes=list_clients(), meses=MESES)
+def grafico_pqr_tipo(metricas: dict, output_dir: str) -> str:
+    por_tipo = metricas.get("por_tipo", {})
+    if not por_tipo:
+        return ""
+
+    tipos = list(por_tipo.keys())[:8]
+    valores = [por_tipo[t] for t in tipos]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    bars = ax.barh(tipos[::-1], valores[::-1], color=COLORS[0], edgecolor="white")
+    ax.set_title("PQR por tipificación")
+    ax.set_xlabel("Cantidad")
+    ax.bar_label(bars, padding=3, fontsize=8)
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "sac_por_tipo")
 
 
-@app.route("/api/config/<cliente>")
-def api_config(cliente):
-    cfg = load_config(cliente)
-    if not cfg:
-        return jsonify({"error": "Cliente no encontrado"}), 404
-    return jsonify(cfg)
+def grafico_sac_semaforo(metricas: dict, output_dir: str) -> str:
+    """Gráfico de torta del semáforo SAC (Cerrado / Crítico / Moderado / Leve)."""
+    por_semaforo = metricas.get("por_semaforo", {})
+    # Fallback al formato antiguo si no hay semáforo
+    if not por_semaforo:
+        abiertos = metricas.get("abiertos", 0)
+        cerrados = metricas.get("cerrados", 0)
+        hurtos   = metricas.get("hurtos", 0)
+        if abiertos + cerrados + hurtos == 0:
+            return ""
+        por_semaforo = {"Cerrado": cerrados, "Abierto": abiertos, "Hurto": hurtos}
+
+    etiquetas = list(por_semaforo.keys())
+    valores   = list(por_semaforo.values())
+    if sum(valores) == 0:
+        return ""
+
+    # Asignar colores por estado
+    color_map = {
+        "Cerrado": COLORS[5],    # verde
+        "Crítico": COLORS[4],    # rojo
+        "Moderado": COLORS[3],   # naranja
+        "Leve":    COLORS[1],    # azul claro
+        "Abierto": COLORS[3],
+        "Hurto":   COLORS[4],
+    }
+    colores = [color_map.get(e, COLORS[6]) for e in etiquetas]
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    wedges, texts, autotexts = ax.pie(
+        valores, labels=None, autopct="%1.1f%%",
+        colors=colores, startangle=90,
+        wedgeprops={"edgecolor": "white", "linewidth": 2}
+    )
+    for at in autotexts:
+        at.set_fontsize(9)
+        at.set_color("white")
+        at.set_fontweight("bold")
+
+    legend_labels = [f"{e} ({v:,})".replace(",", ".") for e, v in zip(etiquetas, valores)]
+    ax.legend(wedges, legend_labels, loc="lower center",
+              bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=8, frameon=False)
+    ax.set_title("Estado de PQR – Semáforo", fontweight="bold", pad=10)
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "sac_semaforo")
 
 
-@app.route("/api/generate", methods=["POST"])
-def api_generate():
-    """
-    Recibe:
-      - cliente (str)
-      - mes (int)
-      - ano (int)
-      - capitulos (JSON array de IDs)
-      - template_word (file, opcional)
-      - db_opex (file, opcional)
-      - db_sac (file, opcional)
-      - db_fact (file, opcional)
-      - db_asistencia (file, opcional)
-    """
-    try:
-        cliente   = request.form.get("cliente", "")
-        mes       = int(request.form.get("mes", 1))
-        ano       = int(request.form.get("ano", 2026))
-        caps_raw  = request.form.get("capitulos", "[]")
-        capitulos = json.loads(caps_raw)
-
-        config = load_config(cliente)
-        if not config:
-            return jsonify({"error": f"Config no encontrada para cliente '{cliente}'"}), 400
-
-        # Crear directorio temporal para esta sesión
-        session_id = uuid.uuid4().hex[:8]
-        sess_dir   = TEMP_FOLDER / session_id
-        sess_dir.mkdir()
-        charts_dir = sess_dir / "charts"
-        charts_dir.mkdir()
-
-        # Guardar archivos subidos
-        saved = {}
-        for key in ["template_word", "db_opex", "db_sac", "db_fact", "db_asistencia"]:
-            f = request.files.get(key)
-            if f and f.filename and allowed(f.filename):
-                fname = secure_filename(f.filename)
-                dest  = sess_dir / fname
-                f.save(str(dest))
-                saved[key] = str(dest)
-
-        # Procesar datos
-        processor = DataProcessor(config, mes, ano)
-        db_files  = {k: v for k, v in saved.items()
-                     if k.startswith("db_") and v}
-        if db_files:
-            processor.cargar_excel(db_files)
-
-        metricas      = processor.get_all_metricas()
-        inconsistencias = metricas.pop("inconsistencias", [])
-
-        # Generar gráficos
-        graficos = generar_todos_los_graficos(metricas, str(charts_dir))
-
-        # Generar Word
-        template_path = saved.get("template_word", "")
-        mes_nombre    = MESES.get(mes, str(mes))
-        output_name   = f"Informe_{cliente}_{mes_nombre}_{ano}.docx"
-        output_path   = str(OUTPUT_FOLDER / output_name)
-
-        gen = WordGenerator(
-            config=config,
-            mes=mes,
-            ano=ano,
-            template_path=template_path,
-            metricas=metricas,
-            graficos=graficos,
-            capitulos_seleccionados=capitulos
-        )
-        gen.agregar_seccion_inconsistencias(inconsistencias)
-        gen.generar(output_path)
-
-        # Limpiar temporales
-        shutil.rmtree(str(sess_dir), ignore_errors=True)
-
-        return jsonify({
-            "success": True,
-            "filename": output_name,
-            "inconsistencias": len(inconsistencias),
-            "metricas_resumen": {
-                "operaciones_total": metricas.get("operaciones", {}).get("total", 0),
-                "sac_total": metricas.get("sac", {}).get("total", 0),
-                "asistencia_total": metricas.get("asistencia", {}).get("total", 0),
-                "facturacion_total": metricas.get("facturacion", {}).get("total_facturado", 0),
-            }
-        })
-
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+def grafico_sac_estado(metricas: dict, output_dir: str) -> str:
+    """Mantiene compatibilidad hacia atrás — llama al nuevo gráfico de semáforo."""
+    return grafico_sac_semaforo(metricas, output_dir)
 
 
-@app.route("/api/download/<filename>")
-def api_download(filename):
-    path = OUTPUT_FOLDER / secure_filename(filename)
-    if not path.exists():
-        return jsonify({"error": "Archivo no encontrado"}), 404
-    return send_file(str(path), as_attachment=True,
-                     download_name=filename,
-                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+def grafico_sac_canal(metricas: dict, output_dir: str) -> str:
+    """Gráfico de barras horizontales por canal de atención SAC."""
+    por_canal = metricas.get("por_canal", {})
+    if not por_canal:
+        return ""
+
+    canales  = list(por_canal.keys())[:6]
+    valores  = [por_canal[c] for c in canales]
+    total    = sum(valores)
+
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    bars = ax.barh(canales[::-1], valores[::-1], color=COLORS[:len(canales)][::-1],
+                   edgecolor="white", height=0.55)
+    for bar, val in zip(bars, valores[::-1]):
+        pct = f"{val/total*100:.1f}%" if total > 0 else ""
+        ax.text(bar.get_width() + max(valores)*0.01, bar.get_y() + bar.get_height()/2,
+                f"{val:,}  ({pct})".replace(",", "."),
+                va="center", ha="left", fontsize=8)
+    ax.set_title("PQR por canal de atención", fontweight="bold")
+    ax.set_xlabel("Cantidad")
+    ax.set_xlim(0, max(valores) * 1.22)
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "sac_canal")
 
 
-@app.route("/api/preview/<filename>")
-def api_preview(filename):
-    """Retorna un resumen de métricas del archivo generado (placeholder)."""
-    path = OUTPUT_FOLDER / secure_filename(filename)
-    return jsonify({"exists": path.exists(), "size_kb": round(path.stat().st_size/1024, 1) if path.exists() else 0})
+def grafico_asistencia_canal(metricas: dict, output_dir: str) -> str:
+    por_canal = metricas.get("por_canal", {})
+    if not por_canal:
+        return ""
+
+    canales = list(por_canal.keys())[:6]
+    valores = [por_canal[c] for c in canales]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.pie(valores, labels=canales, autopct="%1.1f%%",
+           colors=COLORS[:len(canales)],
+           wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+           startangle=90)
+    ax.set_title("Atención usuarios por canal")
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "asistencia_canal")
 
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+def grafico_facturacion_proyecto(metricas: dict, output_dir: str) -> str:
+    por_proy = metricas.get("por_proyecto", {})
+    if not por_proy:
+        return ""
+
+    proyectos = list(por_proy.keys())[:10]
+    totales = [por_proy[p]["total"] / 1_000_000 for p in proyectos]
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    bars = ax.bar(proyectos, totales, color=COLORS[0], edgecolor="white")
+    ax.set_xticks(range(len(proyectos)))
+    ax.set_xticklabels([p[:14] for p in proyectos], rotation=30, ha="right", fontsize=8)
+    ax.set_title("Facturación por proyecto (millones COP)")
+    ax.set_ylabel("Millones COP")
+    ax.bar_label(bars, fmt="%.1f M", padding=3, fontsize=7)
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "facturacion_proyecto")
+
+
+def grafico_reposiciones(metricas: dict, output_dir: str) -> str:
+    por_mun = metricas.get("por_municipio", {})
+    if not por_mun:
+        return ""
+
+    municipios = list(por_mun.keys())[:10]
+    baterias = [por_mun[m]["bateria"] for m in municipios]
+    controladores = [por_mun[m]["controlador"] for m in municipios]
+    inversores = [por_mun[m]["inversor"] for m in municipios]
+
+    x = np.arange(len(municipios))
+    w = 0.25
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(x - w, baterias, w, label="Batería", color=COLORS[1])
+    ax.bar(x, controladores, w, label="Controlador", color=COLORS[3])
+    ax.bar(x + w, inversores, w, label="Inversor", color=COLORS[4])
+    ax.set_xticks(x)
+    ax.set_xticklabels([m[:12] for m in municipios], rotation=30, ha="right", fontsize=8)
+    ax.set_title("Reposiciones por componente y municipio")
+    ax.set_ylabel("Unidades")
+    ax.legend()
+    fig.tight_layout()
+    return _save_fig(fig, output_dir, "reposiciones")
+
+
+def generar_todos_los_graficos(metricas: dict, output_dir: str) -> dict:
+    """Genera todos los gráficos disponibles y retorna rutas."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    graficos = {}
+
+    ops = metricas.get("operaciones", {})
+    sac = metricas.get("sac", {})
+    asist = metricas.get("asistencia", {})
+    fact = metricas.get("facturacion", {})
+    repos = metricas.get("reposiciones", {})
+
+    if ops:
+        graficos["operaciones_municipio"] = grafico_barras_operaciones(ops, output_dir)
+        graficos["operaciones_torta"] = grafico_torta_funcionalidad(ops, output_dir)
+
+    if sac:
+        graficos["sac_tipo"]     = grafico_pqr_tipo(sac, output_dir)
+        graficos["sac_semaforo"] = grafico_sac_semaforo(sac, output_dir)
+        graficos["sac_estado"]   = graficos["sac_semaforo"]   # alias compatibilidad
+        graficos["sac_canal"]    = grafico_sac_canal(sac, output_dir)
+
+    if asist:
+        graficos["asistencia_canal"] = grafico_asistencia_canal(asist, output_dir)
+
+    if fact:
+        graficos["facturacion_proyecto"] = grafico_facturacion_proyecto(fact, output_dir)
+
+    if repos:
+        graficos["reposiciones"] = grafico_reposiciones(repos, output_dir)
+
+    return {k: v for k, v in graficos.items() if v}
